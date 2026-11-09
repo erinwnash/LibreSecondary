@@ -15,6 +15,8 @@ namespace LibreSecondary {
 
 namespace {
 
+constexpr float kPi = 3.14159265358979323846f;
+
 // Helper: RGB to HSV conversion (inputs/outputs normalized to [0.0, 1.0])
 inline void rgb2hsv(float r, float g, float b, float &h, float &s, float &v) {
     float maxVal = std::max(r, std::max(g, b));
@@ -50,15 +52,166 @@ inline void rgb2hsv(float r, float g, float b, float &h, float &s, float &v) {
     }
 }
 
-// Helper: Standard Hermite smoothstep interpolation
-inline float smoothstep(float edge0, float edge1, float x) {
-    if (edge1 <= edge0) {
-        return (x >= edge0) ? 1.0f : 0.0f;
+// Helper: RGB to HSL conversion (inputs/outputs normalized to [0.0, 1.0])
+inline void rgb2hsl(float r, float g, float b, float &h, float &s, float &l) {
+    float maxVal = std::max(r, std::max(g, b));
+    float minVal = std::min(r, std::min(g, b));
+    float delta = maxVal - minVal;
+
+    l = (maxVal + minVal) * 0.5f;
+
+    if (delta < 1e-6f) {
+        s = 0.0f;
+        h = 0.0f;
+        return;
     }
-    if (x <= edge0) return 0.0f;
-    if (x >= edge1) return 1.0f;
-    float t = (x - edge0) / (edge1 - edge0);
-    return t * t * (3.0f - 2.0f * t);
+
+    float denom = 1.0f - std::fabs(2.0f * l - 1.0f);
+    s = (denom > 1e-6f) ? (delta / denom) : 0.0f;
+
+    if (r >= maxVal) {
+        h = (g - b) / delta;
+    } else if (g >= maxVal) {
+        h = 2.0f + (b - r) / delta;
+    } else {
+        h = 4.0f + (r - g) / delta;
+    }
+
+    h /= 6.0f;
+    if (h < 0.0f) {
+        h += 1.0f;
+    }
+}
+
+// Helper: RGB to YCbCr conversion (ITU-R BT.709 standard, normalized to [0.0, 1.0])
+inline void rgb2ycbcr(float r, float g, float b, float &y, float &cb, float &cr) {
+    y  =  0.2126f * r + 0.7152f * g + 0.0722f * b;
+    // Map bipolar chroma [-0.5, 0.5] to [0.0, 1.0] with neutral 0.5
+    cb = -0.1146f * r - 0.3854f * g + 0.5000f * b + 0.5f;
+    cr =  0.5000f * r - 0.4542f * g - 0.0458f * b + 0.5f;
+}
+
+// Unified color space transformation helper
+inline Color3 rgbToSpace(float r, float g, float b, ColorSpaceEnum space) {
+    Color3 out{0.0f, 0.0f, 0.0f};
+    switch (space) {
+        case eColorSpaceHSV:
+            rgb2hsv(r, g, b, out.c1, out.c2, out.c3);
+            break;
+        case eColorSpaceHSL:
+            rgb2hsl(r, g, b, out.c1, out.c2, out.c3);
+            break;
+        case eColorSpaceYCbCr:
+            rgb2ycbcr(r, g, b, out.c1, out.c2, out.c3);
+            break;
+    }
+    return out;
+}
+
+// Helper: compute distances between sample and target in the active color space
+inline void computeDistances(const Color3 &sample, const Color3 &target, ColorSpaceEnum space,
+                             float &d1, float &d2, float &d3) {
+    if (space == eColorSpaceHSV || space == eColorSpaceHSL) {
+        // Channel 1 is Hue (circular on [0, 1))
+        float dh = std::fabs(sample.c1 - target.c1);
+        if (dh > 0.5f) {
+            dh = 1.0f - dh;
+        }
+        d1 = dh;
+        // Channel 2 is Saturation
+        d2 = std::fabs(sample.c2 - target.c2);
+        // Channel 3 is Value (HSV) or Lightness (HSL)
+        d3 = std::fabs(sample.c3 - target.c3);
+    } else {
+        // eColorSpaceYCbCr: Cartesian Euclidean distances on [0, 1]
+        // Channel 1: Luma Y
+        d1 = std::fabs(sample.c1 - target.c1);
+        // Channel 2: Chroma Cb
+        d2 = std::fabs(sample.c2 - target.c2);
+        // Channel 3: Chroma Cr
+        d3 = std::fabs(sample.c3 - target.c3);
+    }
+}
+
+// Helper: 4 best falloff transition curves
+inline float evaluateFalloff(float dist, float spread, float falloff, FalloffCurveEnum curve) {
+    if (dist <= spread) {
+        return 1.0f;
+    }
+    float edge1 = spread + std::max(1e-5f, falloff);
+    if (dist >= edge1) {
+        return 0.0f;
+    }
+    float t = (dist - spread) / (edge1 - spread);
+    t = std::max(0.0f, std::min(t, 1.0f));
+
+    switch (curve) {
+        case eFalloffCurveSmoothstep:
+            // Hermite cubic: 1.0 - (3t^2 - 2t^3)
+            return 1.0f - t * t * (3.0f - 2.0f * t);
+
+        case eFalloffCurveSmootherstep:
+            // Perlin quintic: 1.0 - (6t^5 - 15t^4 + 10t^3)
+            return 1.0f - t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
+
+        case eFalloffCurveCosine:
+            // Photographic Cosine S-curve: 0.5 * (1.0 + cos(pi * t))
+            return 0.5f * (1.0f + std::cos(kPi * t));
+
+        case eFalloffCurveLinear:
+            // Linear ramp: 1.0 - t
+            return 1.0f - t;
+    }
+    return 1.0f - t * t * (3.0f - 2.0f * t);
+}
+
+// Helper: generate 1D separable convolution blur kernel for the 4 best filter types
+inline void generateBlurKernel(FilterTypeEnum type, float radiusParam, int kRadius, std::vector<float> &kernel) {
+    kernel.resize(2 * kRadius + 1);
+    float sumW = 0.0f;
+    float sigma = std::max(0.1f, radiusParam);
+
+    switch (type) {
+        case eFilterTypeGaussian: {
+            float twoSigmaSq = 2.0f * sigma * sigma;
+            for (int i = -kRadius; i <= kRadius; ++i) {
+                float w = std::exp(-static_cast<float>(i * i) / twoSigmaSq);
+                kernel[i + kRadius] = w;
+                sumW += w;
+            }
+            break;
+        }
+        case eFilterTypeBox: {
+            for (int i = -kRadius; i <= kRadius; ++i) {
+                kernel[i + kRadius] = 1.0f;
+                sumW += 1.0f;
+            }
+            break;
+        }
+        case eFilterTypeTriangle: {
+            float rPlus1 = static_cast<float>(kRadius + 1);
+            for (int i = -kRadius; i <= kRadius; ++i) {
+                float w = 1.0f - std::fabs(static_cast<float>(i)) / rPlus1;
+                kernel[i + kRadius] = w;
+                sumW += w;
+            }
+            break;
+        }
+        case eFilterTypeExponential: {
+            for (int i = -kRadius; i <= kRadius; ++i) {
+                float w = std::exp(-std::fabs(static_cast<float>(i)) / sigma);
+                kernel[i + kRadius] = w;
+                sumW += w;
+            }
+            break;
+        }
+    }
+
+    if (sumW > 1e-6f) {
+        for (float &w : kernel) {
+            w /= sumW;
+        }
+    }
 }
 
 // Helper: Expand an OfxRectI by uniform padding
@@ -93,13 +246,23 @@ SecondaryKeyerProcessor::SecondaryKeyerProcessor(OFX::ImageEffect &effect,
         _srcBounds = _srcImg->getBounds();
     }
 
-    // Convert target colors to HSV space
-    rgb2hsv(_params.pickR, _params.pickG, _params.pickB, _pickH, _pickS, _pickV);
-    if (_params.enableAdd) {
-        rgb2hsv(_params.addR, _params.addG, _params.addB, _addH, _addS, _addV);
+    // Pre-convert target colors to the active color space
+    _targetBase = rgbToSpace(_params.basePick.r, _params.basePick.g, _params.basePick.b, _params.colorSpace);
+
+    // Additional colors: include legacy add color if enabled
+    if (_params.enableLegacyAdd) {
+        _targetsAdd.push_back(rgbToSpace(_params.legacyAdd.r, _params.legacyAdd.g, _params.legacyAdd.b, _params.colorSpace));
     }
-    if (_params.enableSub) {
-        rgb2hsv(_params.subR, _params.subG, _params.subB, _subH, _subS, _subV);
+    for (const auto &col : _params.addColors) {
+        _targetsAdd.push_back(rgbToSpace(col.r, col.g, col.b, _params.colorSpace));
+    }
+
+    // Subtracted colors: include legacy sub color if enabled
+    if (_params.enableLegacySub) {
+        _targetsSub.push_back(rgbToSpace(_params.legacySub.r, _params.legacySub.g, _params.legacySub.b, _params.colorSpace));
+    }
+    for (const auto &col : _params.subColors) {
+        _targetsSub.push_back(rgbToSpace(col.r, col.g, col.b, _params.colorSpace));
     }
 
     // Determine spatial filtering radii
@@ -128,23 +291,7 @@ SecondaryKeyerProcessor::SecondaryKeyerProcessor(OFX::ImageEffect &effect,
             _bufBlurH = MatteBuffer(OfxRectI{rectDst.x1, rectGrow.y1, rectDst.x2, rectGrow.y2});
             _bufBlurV = MatteBuffer(rectDst);
 
-            // Precalculate 1D Gaussian kernel
-            float sigma = std::max(0.1f, _params.matteBlur);
-            int kRadius = _blurRadius;
-            _blurKernel.resize(2 * kRadius + 1);
-            float sumW = 0.0f;
-            float twoSigmaSq = 2.0f * sigma * sigma;
-
-            for (int i = -kRadius; i <= kRadius; ++i) {
-                float w = std::exp(-static_cast<float>(i * i) / twoSigmaSq);
-                _blurKernel[i + kRadius] = w;
-                sumW += w;
-            }
-            if (sumW > 1e-6f) {
-                for (float &w : _blurKernel) {
-                    w /= sumW;
-                }
-            }
+            generateBlurKernel(_params.filterType, _params.matteBlur, _blurRadius, _blurKernel);
         }
     }
 }
@@ -157,7 +304,7 @@ void SecondaryKeyerProcessor::process() {
     bool needsSpatial = (rShrink > 0 || rGrow > 0 || rBlur > 0);
 
     if (!needsSpatial) {
-        // Fast direct pass: compute raw qualifier and composite straight to destination
+        // Fast direct pass: compute qualifier and composite straight to destination
         _currentPass = ePassDirectRender;
         _currentRect = _renderWindow;
         multiThread();
@@ -189,7 +336,7 @@ void SecondaryKeyerProcessor::process() {
         curBuf = &_bufGrow;
     }
 
-    // Pass 4 & 5: Separable Gaussian Blur (Horizontal & Vertical convolution)
+    // Pass 4 & 5: Separable Blur Convolution (Horizontal & Vertical passes)
     if (rBlur > 0) {
         _currentPass = ePassBlurH;
         _currentRect = _bufBlurH.bounds();
@@ -265,42 +412,36 @@ void SecondaryKeyerProcessor::sampleSource(int x, int y, float &r, float &g, flo
     }
 }
 
-float SecondaryKeyerProcessor::computeMatte(float h, float s, float v,
-                                            float targetH, float targetS, float targetV) const {
-    // Hue circular distance on [0, 1)
-    float dh = std::fabs(h - targetH);
-    if (dh > 0.5f) {
-        dh = 1.0f - dh;
-    }
-    float ds = std::fabs(s - targetS);
-    float dv = std::fabs(v - targetV);
+float SecondaryKeyerProcessor::evaluateSingleTarget(const Color3 &sample, const Color3 &target) const {
+    float d1, d2, d3;
+    computeDistances(sample, target, _params.colorSpace, d1, d2, d3);
 
-    // Hermite smoothstep keying curves
-    float mH = 1.0f - smoothstep(_params.hueSpread, _params.hueSpread + _params.hueFalloff, dh);
-    float mS = 1.0f - smoothstep(_params.satSpread, _params.satSpread + _params.satFalloff, ds);
-    float mV = 1.0f - smoothstep(_params.valSpread, _params.valSpread + _params.valFalloff, dv);
+    float m1 = evaluateFalloff(d1, _params.spread1, _params.falloff1, _params.falloffCurve);
+    float m2 = evaluateFalloff(d2, _params.spread2, _params.falloff2, _params.falloffCurve);
+    float m3 = evaluateFalloff(d3, _params.spread3, _params.falloff3, _params.falloffCurve);
 
-    return mH * mS * mV;
+    return m1 * m2 * m3;
 }
 
 float SecondaryKeyerProcessor::evaluateMatte(float r, float g, float b) const {
-    float h, s, v;
-    rgb2hsv(r, g, b, h, s, v);
+    Color3 sample = rgbToSpace(r, g, b, _params.colorSpace);
 
-    float baseMatte = computeMatte(h, s, v, _pickH, _pickS, _pickV);
-    float combined = baseMatte;
+    // Base color qualification
+    float matte = evaluateSingleTarget(sample, _targetBase);
 
-    if (_params.enableAdd) {
-        float addMatte = computeMatte(h, s, v, _addH, _addS, _addV);
-        combined = std::max(combined, addMatte);
+    // Additional colors: union (max)
+    for (const auto &target : _targetsAdd) {
+        float mAdd = evaluateSingleTarget(sample, target);
+        matte = std::max(matte, mAdd);
     }
 
-    if (_params.enableSub) {
-        float subMatte = computeMatte(h, s, v, _subH, _subS, _subV);
-        combined = std::max(0.0f, combined - subMatte);
+    // Subtracted colors: subtraction (carve out)
+    for (const auto &target : _targetsSub) {
+        float mSub = evaluateSingleTarget(sample, target);
+        matte = std::max(0.0f, matte - mSub);
     }
 
-    return std::max(0.0f, std::min(combined, 1.0f));
+    return std::max(0.0f, std::min(matte, 1.0f));
 }
 
 void SecondaryKeyerProcessor::processDirectRender(int yStart, int yEnd) {
@@ -455,13 +596,50 @@ SecondaryKeyerPlugin::SecondaryKeyerPlugin(OfxImageEffectHandle handle)
     dstClip_ = fetchClip(kOfxImageEffectOutputClipName);
     srcClip_ = fetchClip(kOfxImageEffectSimpleSourceClipName);
 
-    // Fetch parameter handles
+    // Global settings
+    colorSpace_   = fetchChoiceParam(kParamColorSpace);
+    falloffCurve_ = fetchChoiceParam(kParamFalloffCurve);
+
+    // Base Color Picker
     hsvPick_   = fetchRGBParam(kParamHsvPick);
+
+    // Legacy Single Add/Sub parameters
     enableAdd_ = fetchBooleanParam(kParamEnableAdd);
     colorAdd_  = fetchRGBParam(kParamColorAdd);
     enableSub_ = fetchBooleanParam(kParamEnableSub);
     colorSub_  = fetchRGBParam(kParamColorSub);
 
+    // Dynamic Add Colors Group Controls
+    grpAddColors_   = fetchGroupParam(kParamGrpAddColors);
+    pickAddColor_   = fetchRGBParam(kParamPickAddColor);
+    continuousAdd_  = fetchBooleanParam(kParamContinuousAdd);
+    btnAddColor_    = fetchPushButtonParam(kParamBtnAddColor);
+    btnClearAdd_    = fetchPushButtonParam(kParamBtnClearAdd);
+    numAddColors_   = fetchIntParam(kParamNumAddColors);
+
+    for (int i = 0; i < kMaxListColors; ++i) {
+        std::string nameColor = std::string(kParamPrefixAddColor) + std::to_string(i);
+        std::string nameDel   = std::string(kParamPrefixDelAdd) + std::to_string(i);
+        addColors_[i] = fetchRGBParam(nameColor);
+        delAddBtns_[i] = fetchPushButtonParam(nameDel);
+    }
+
+    // Dynamic Sub Colors Group Controls
+    grpSubColors_   = fetchGroupParam(kParamGrpSubColors);
+    pickSubColor_   = fetchRGBParam(kParamPickSubColor);
+    continuousSub_  = fetchBooleanParam(kParamContinuousSub);
+    btnSubColor_    = fetchPushButtonParam(kParamBtnSubColor);
+    btnClearSub_    = fetchPushButtonParam(kParamBtnClearSub);
+    numSubColors_   = fetchIntParam(kParamNumSubColors);
+
+    for (int i = 0; i < kMaxListColors; ++i) {
+        std::string nameColor = std::string(kParamPrefixSubColor) + std::to_string(i);
+        std::string nameDel   = std::string(kParamPrefixDelSub) + std::to_string(i);
+        subColors_[i] = fetchRGBParam(nameColor);
+        delSubBtns_[i] = fetchPushButtonParam(nameDel);
+    }
+
+    // Tolerance controls
     hueSpread_  = fetchDoubleParam(kParamHueSpread);
     hueFalloff_ = fetchDoubleParam(kParamHueFalloff);
     satSpread_  = fetchDoubleParam(kParamSatSpread);
@@ -469,11 +647,183 @@ SecondaryKeyerPlugin::SecondaryKeyerPlugin(OfxImageEffectHandle handle)
     valSpread_  = fetchDoubleParam(kParamValSpread);
     valFalloff_ = fetchDoubleParam(kParamValFalloff);
 
+    // Matte Finesse controls
     matteShrink_ = fetchDoubleParam(kParamMatteShrink);
     matteGrow_   = fetchDoubleParam(kParamMatteGrow);
     matteBlur_   = fetchDoubleParam(kParamMatteBlur);
+    filterType_  = fetchChoiceParam(kParamFilterType);
 
-    outputMode_ = fetchChoiceParam(kParamOutputMode);
+    outputMode_  = fetchChoiceParam(kParamOutputMode);
+
+    syncListVisibility();
+}
+
+int SecondaryKeyerPlugin::getNumAddColors() const {
+    if (!numAddColors_) return 0;
+    int v = 0;
+    numAddColors_->getValue(v);
+    return std::max(0, std::min(v, kMaxListColors));
+}
+
+void SecondaryKeyerPlugin::setNumAddColors(int count) {
+    if (numAddColors_) {
+        numAddColors_->setValue(std::max(0, std::min(count, kMaxListColors)));
+    }
+}
+
+void SecondaryKeyerPlugin::removeAddColor(int idx) {
+    int count = getNumAddColors();
+    if (idx < 0 || idx >= count) return;
+
+    for (int i = idx; i < count - 1; ++i) {
+        if (addColors_[i] && addColors_[i + 1]) {
+            double r, g, b;
+            addColors_[i + 1]->getValue(r, g, b);
+            addColors_[i]->setValue(r, g, b);
+        }
+    }
+
+    if (addColors_[count - 1]) addColors_[count - 1]->setIsSecret(true);
+    if (delAddBtns_[count - 1]) delAddBtns_[count - 1]->setIsSecret(true);
+    setNumAddColors(count - 1);
+}
+
+int SecondaryKeyerPlugin::getNumSubColors() const {
+    if (!numSubColors_) return 0;
+    int v = 0;
+    numSubColors_->getValue(v);
+    return std::max(0, std::min(v, kMaxListColors));
+}
+
+void SecondaryKeyerPlugin::setNumSubColors(int count) {
+    if (numSubColors_) {
+        numSubColors_->setValue(std::max(0, std::min(count, kMaxListColors)));
+    }
+}
+
+void SecondaryKeyerPlugin::removeSubColor(int idx) {
+    int count = getNumSubColors();
+    if (idx < 0 || idx >= count) return;
+
+    for (int i = idx; i < count - 1; ++i) {
+        if (subColors_[i] && subColors_[i + 1]) {
+            double r, g, b;
+            subColors_[i + 1]->getValue(r, g, b);
+            subColors_[i]->setValue(r, g, b);
+        }
+    }
+
+    if (subColors_[count - 1]) subColors_[count - 1]->setIsSecret(true);
+    if (delSubBtns_[count - 1]) delSubBtns_[count - 1]->setIsSecret(true);
+    setNumSubColors(count - 1);
+}
+
+void SecondaryKeyerPlugin::syncListVisibility() {
+    int addCount = getNumAddColors();
+    for (int i = 0; i < kMaxListColors; ++i) {
+        bool visible = (i < addCount);
+        if (addColors_[i]) addColors_[i]->setIsSecret(!visible);
+        if (delAddBtns_[i]) delAddBtns_[i]->setIsSecret(!visible);
+    }
+
+    int subCount = getNumSubColors();
+    for (int i = 0; i < kMaxListColors; ++i) {
+        bool visible = (i < subCount);
+        if (subColors_[i]) subColors_[i]->setIsSecret(!visible);
+        if (delSubBtns_[i]) delSubBtns_[i]->setIsSecret(!visible);
+    }
+}
+
+void SecondaryKeyerPlugin::changedParam(const OFX::InstanceChangedArgs &args, const std::string &paramName) {
+    // Continuous selection or button click: Add Colors
+    if (paramName == kParamBtnAddColor ||
+        (paramName == kParamPickAddColor && continuousAdd_ && args.reason == OFX::eChangeUserEdit)) {
+        bool continuous = false;
+        if (continuousAdd_) continuousAdd_->getValue(continuous);
+
+        if (paramName == kParamBtnAddColor || continuous) {
+            double r, g, b;
+            pickAddColor_->getValueAtTime(args.time, r, g, b);
+
+            int count = getNumAddColors();
+            bool isDuplicate = false;
+            if (count > 0 && addColors_[count - 1]) {
+                double pr, pg, pb;
+                addColors_[count - 1]->getValue(pr, pg, pb);
+                double dr = r - pr, dg = g - pg, db = b - pb;
+                if (dr * dr + dg * dg + db * db < 0.0004) {
+                    isDuplicate = true;
+                }
+            }
+
+            if (!isDuplicate && count < kMaxListColors) {
+                if (addColors_[count]) {
+                    addColors_[count]->setValue(r, g, b);
+                    addColors_[count]->setIsSecret(false);
+                }
+                if (delAddBtns_[count]) {
+                    delAddBtns_[count]->setIsSecret(false);
+                }
+                setNumAddColors(count + 1);
+            }
+        }
+    } else if (paramName == kParamBtnClearAdd) {
+        for (int i = 0; i < kMaxListColors; ++i) {
+            if (addColors_[i]) addColors_[i]->setIsSecret(true);
+            if (delAddBtns_[i]) delAddBtns_[i]->setIsSecret(true);
+        }
+        setNumAddColors(0);
+    } else if (paramName.rfind(kParamPrefixDelAdd, 0) == 0) {
+        try {
+            int idx = std::stoi(paramName.substr(std::string(kParamPrefixDelAdd).length()));
+            removeAddColor(idx);
+        } catch (...) {}
+    }
+
+    // Continuous selection or button click: Sub Colors
+    if (paramName == kParamBtnSubColor ||
+        (paramName == kParamPickSubColor && continuousSub_ && args.reason == OFX::eChangeUserEdit)) {
+        bool continuous = false;
+        if (continuousSub_) continuousSub_->getValue(continuous);
+
+        if (paramName == kParamBtnSubColor || continuous) {
+            double r, g, b;
+            pickSubColor_->getValueAtTime(args.time, r, g, b);
+
+            int count = getNumSubColors();
+            bool isDuplicate = false;
+            if (count > 0 && subColors_[count - 1]) {
+                double pr, pg, pb;
+                subColors_[count - 1]->getValue(pr, pg, pb);
+                double dr = r - pr, dg = g - pg, db = b - pb;
+                if (dr * dr + dg * dg + db * db < 0.0004) {
+                    isDuplicate = true;
+                }
+            }
+
+            if (!isDuplicate && count < kMaxListColors) {
+                if (subColors_[count]) {
+                    subColors_[count]->setValue(r, g, b);
+                    subColors_[count]->setIsSecret(false);
+                }
+                if (delSubBtns_[count]) {
+                    delSubBtns_[count]->setIsSecret(false);
+                }
+                setNumSubColors(count + 1);
+            }
+        }
+    } else if (paramName == kParamBtnClearSub) {
+        for (int i = 0; i < kMaxListColors; ++i) {
+            if (subColors_[i]) subColors_[i]->setIsSecret(true);
+            if (delSubBtns_[i]) delSubBtns_[i]->setIsSecret(true);
+        }
+        setNumSubColors(0);
+    } else if (paramName.rfind(kParamPrefixDelSub, 0) == 0) {
+        try {
+            int idx = std::stoi(paramName.substr(std::string(kParamPrefixDelSub).length()));
+            removeSubColor(idx);
+        } catch (...) {}
+    }
 }
 
 double SecondaryKeyerPlugin::calculateSpatialPadding(double time) const {
@@ -491,44 +841,81 @@ double SecondaryKeyerPlugin::calculateSpatialPadding(double time) const {
 KeyerParams SecondaryKeyerPlugin::fetchParams(double time) const {
     KeyerParams p{};
 
+    if (colorSpace_) {
+        int cs = 0;
+        colorSpace_->getValueAtTime(time, cs);
+        p.colorSpace = static_cast<ColorSpaceEnum>(cs);
+    }
+    if (falloffCurve_) {
+        int fc = 0;
+        falloffCurve_->getValueAtTime(time, fc);
+        p.falloffCurve = static_cast<FalloffCurveEnum>(fc);
+    }
+    if (filterType_) {
+        int ft = 0;
+        filterType_->getValueAtTime(time, ft);
+        p.filterType = static_cast<FilterTypeEnum>(ft);
+    }
+
     if (hsvPick_) {
         double r, g, b;
         hsvPick_->getValueAtTime(time, r, g, b);
-        p.pickR = static_cast<float>(r);
-        p.pickG = static_cast<float>(g);
-        p.pickB = static_cast<float>(b);
+        p.basePick.r = static_cast<float>(r);
+        p.basePick.g = static_cast<float>(g);
+        p.basePick.b = static_cast<float>(b);
     }
+
+    // Legacy Single Add/Sub
     if (enableAdd_) {
         bool v;
         enableAdd_->getValueAtTime(time, v);
-        p.enableAdd = v;
+        p.enableLegacyAdd = v;
     }
     if (colorAdd_) {
         double r, g, b;
         colorAdd_->getValueAtTime(time, r, g, b);
-        p.addR = static_cast<float>(r);
-        p.addG = static_cast<float>(g);
-        p.addB = static_cast<float>(b);
+        p.legacyAdd.r = static_cast<float>(r);
+        p.legacyAdd.g = static_cast<float>(g);
+        p.legacyAdd.b = static_cast<float>(b);
     }
     if (enableSub_) {
         bool v;
         enableSub_->getValueAtTime(time, v);
-        p.enableSub = v;
+        p.enableLegacySub = v;
     }
     if (colorSub_) {
         double r, g, b;
         colorSub_->getValueAtTime(time, r, g, b);
-        p.subR = static_cast<float>(r);
-        p.subG = static_cast<float>(g);
-        p.subB = static_cast<float>(b);
+        p.legacySub.r = static_cast<float>(r);
+        p.legacySub.g = static_cast<float>(g);
+        p.legacySub.b = static_cast<float>(b);
     }
 
-    if (hueSpread_)  p.hueSpread  = static_cast<float>(hueSpread_->getValueAtTime(time));
-    if (hueFalloff_) p.hueFalloff = static_cast<float>(std::max(0.001, hueFalloff_->getValueAtTime(time)));
-    if (satSpread_)  p.satSpread  = static_cast<float>(satSpread_->getValueAtTime(time));
-    if (satFalloff_) p.satFalloff = static_cast<float>(std::max(0.001, satFalloff_->getValueAtTime(time)));
-    if (valSpread_)  p.valSpread  = static_cast<float>(valSpread_->getValueAtTime(time));
-    if (valFalloff_) p.valFalloff = static_cast<float>(std::max(0.001, valFalloff_->getValueAtTime(time)));
+    // Dynamic Multi-Color Lists
+    int addCount = getNumAddColors();
+    for (int i = 0; i < addCount; ++i) {
+        if (addColors_[i]) {
+            double r, g, b;
+            addColors_[i]->getValueAtTime(time, r, g, b);
+            p.addColors.push_back({static_cast<float>(r), static_cast<float>(g), static_cast<float>(b)});
+        }
+    }
+
+    int subCount = getNumSubColors();
+    for (int i = 0; i < subCount; ++i) {
+        if (subColors_[i]) {
+            double r, g, b;
+            subColors_[i]->getValueAtTime(time, r, g, b);
+            p.subColors.push_back({static_cast<float>(r), static_cast<float>(g), static_cast<float>(b)});
+        }
+    }
+
+    if (hueSpread_)  p.spread1  = static_cast<float>(hueSpread_->getValueAtTime(time));
+    if (hueFalloff_) p.falloff1 = static_cast<float>(std::max(0.001, hueFalloff_->getValueAtTime(time)));
+    if (satSpread_)  p.spread2  = static_cast<float>(satSpread_->getValueAtTime(time));
+    if (satFalloff_) p.falloff2 = static_cast<float>(std::max(0.001, satFalloff_->getValueAtTime(time)));
+    if (valSpread_)  p.spread3  = static_cast<float>(valSpread_->getValueAtTime(time));
+    if (valFalloff_) p.falloff3 = static_cast<float>(std::max(0.001, valFalloff_->getValueAtTime(time)));
 
     if (matteShrink_) p.matteShrink = static_cast<float>(std::max(0.0, matteShrink_->getValueAtTime(time)));
     if (matteGrow_)   p.matteGrow   = static_cast<float>(std::max(0.0, matteGrow_->getValueAtTime(time)));
@@ -627,7 +1014,7 @@ SecondaryKeyerFactory::SecondaryKeyerFactory()
 void SecondaryKeyerFactory::describe(OFX::ImageEffectDescriptor &desc) {
     desc.setLabels("LibreSecondary", "LibreSecondary", "Libre Secondary Keyer");
     desc.setPluginGrouping("Color/Keyer");
-    desc.setPluginDescription("High-performance DaVinci Resolve-style secondary qualifier for Foundry Nuke.");
+    desc.setPluginDescription("Multi-space (HSV, HSL, YCbCr) secondary qualifier with continuous color picking and finesse filtering.");
 
     // Support Contexts: Filter and General
     desc.addSupportedContext(OFX::eContextFilter);
@@ -661,47 +1048,158 @@ void SecondaryKeyerFactory::describeInContext(OFX::ImageEffectDescriptor &desc, 
     // 2. Parameters Page
     OFX::PageParamDescriptor *page = desc.definePageParam("Controls");
 
-    // HSV Base Color Picker
+    // Color Space Selection
+    OFX::ChoiceParamDescriptor *colorSpace = desc.defineChoiceParam(kParamColorSpace);
+    colorSpace->setLabels("Color Space", "Color Space", "Qualification color space");
+    colorSpace->setHint("Choose operating space: HSV, HSL, or broadcast YCbCr (Rec. 709)");
+    colorSpace->appendOption("HSV (Hue, Saturation, Value)");
+    colorSpace->appendOption("HSL (Hue, Saturation, Lightness)");
+    colorSpace->appendOption("YCbCr (Rec. 709 Luma & Chroma)");
+    colorSpace->setDefault(0);
+    colorSpace->setAnimates(true);
+    page->addChild(*colorSpace);
+
+    // Falloff Curve Selection (4 best curves)
+    OFX::ChoiceParamDescriptor *falloffCurve = desc.defineChoiceParam(kParamFalloffCurve);
+    falloffCurve->setLabels("Falloff Curve", "Falloff Curve", "Transition falloff profile");
+    falloffCurve->setHint("Select the mathematical curve used for transition roll-off");
+    falloffCurve->appendOption("Smoothstep (Hermite Cubic)");
+    falloffCurve->appendOption("Smootherstep (Perlin Quintic)");
+    falloffCurve->appendOption("Cosine (Filmic S-Curve)");
+    falloffCurve->appendOption("Linear (Crisp Slope)");
+    falloffCurve->setDefault(0);
+    falloffCurve->setAnimates(true);
+    page->addChild(*falloffCurve);
+
+    // Base Color Picker
     OFX::RGBParamDescriptor *hsvPick = desc.defineRGBParam(kParamHsvPick);
-    hsvPick->setLabels("Pick Color", "Pick Color", "Pick base color");
-    hsvPick->setHint("Target base color to isolate using HSV qualification");
+    hsvPick->setLabels("Pick Base Color", "Pick Color", "Base color to qualify");
+    hsvPick->setHint("Target primary base color to isolate");
     hsvPick->setDefault(0.0, 0.0, 0.0);
     hsvPick->setAnimates(true);
     page->addChild(*hsvPick);
 
-    // Additional Qualified Color
-    OFX::BooleanParamDescriptor *enableAdd = desc.defineBooleanParam(kParamEnableAdd);
-    enableAdd->setLabels("Enable Add", "Enable Add", "Enable add color");
-    enableAdd->setHint("Include a secondary color in the qualified matte");
-    enableAdd->setDefault(false);
-    enableAdd->setAnimates(true);
-    page->addChild(*enableAdd);
+    // -------------------------------------------------------------------------
+    // Add Colors (Expand Matte) Group - Spins up under an arrow
+    // -------------------------------------------------------------------------
+    OFX::GroupParamDescriptor *grpAdd = desc.defineGroupParam(kParamGrpAddColors);
+    grpAdd->setLabels("Add Colors (Expand Matte)", "Add Colors", "Additional qualified colors list");
+    grpAdd->setHint("List of colors to add/union into the qualified matte");
+    grpAdd->setOpen(false); // Spins up (collapsed) under an arrow by default
+    page->addChild(*grpAdd);
 
-    OFX::RGBParamDescriptor *colorAdd = desc.defineRGBParam(kParamColorAdd);
-    colorAdd->setLabels("Color Add", "Color Add", "Additional color");
-    colorAdd->setHint("Color to add to the qualified matte");
-    colorAdd->setDefault(0.0, 0.0, 0.0);
-    colorAdd->setAnimates(true);
-    page->addChild(*colorAdd);
+    OFX::RGBParamDescriptor *pickAdd = desc.defineRGBParam(kParamPickAddColor);
+    pickAdd->setLabels("Sample Add Color", "Sample Add", "Eye-dropper for adding colors");
+    pickAdd->setHint("Sample with the eye-dropper to add colors continuously or via button");
+    pickAdd->setDefault(0.0, 0.0, 0.0);
+    pickAdd->setParent(*grpAdd);
+    page->addChild(*pickAdd);
 
-    // Subtracted Qualified Color
-    OFX::BooleanParamDescriptor *enableSub = desc.defineBooleanParam(kParamEnableSub);
-    enableSub->setLabels("Enable Sub", "Enable Sub", "Enable subtract color");
-    enableSub->setHint("Exclude a color range from the qualified matte");
-    enableSub->setDefault(false);
-    enableSub->setAnimates(true);
-    page->addChild(*enableSub);
+    OFX::BooleanParamDescriptor *contAdd = desc.defineBooleanParam(kParamContinuousAdd);
+    contAdd->setLabels("Continuous Selection Mode", "Continuous", "Auto-add on eye-dropper sampling");
+    contAdd->setHint("Automatically add new sampled colors to the list when picking footage");
+    contAdd->setDefault(true);
+    contAdd->setParent(*grpAdd);
+    page->addChild(*contAdd);
 
-    OFX::RGBParamDescriptor *colorSub = desc.defineRGBParam(kParamColorSub);
-    colorSub->setLabels("Color Sub", "Color Sub", "Subtracted color");
-    colorSub->setHint("Color to remove from the qualified matte");
-    colorSub->setDefault(0.0, 0.0, 0.0);
-    colorSub->setAnimates(true);
-    page->addChild(*colorSub);
+    OFX::PushButtonParamDescriptor *btnAdd = desc.definePushButtonParam(kParamBtnAddColor);
+    btnAdd->setLabels("+ Add Sampled Color", "+ Add Color", "Append sampled color to list");
+    btnAdd->setParent(*grpAdd);
+    page->addChild(*btnAdd);
 
-    // Hue Controls
+    OFX::PushButtonParamDescriptor *btnClearAdd = desc.definePushButtonParam(kParamBtnClearAdd);
+    btnClearAdd->setLabels("Clear All Add Colors", "Clear All", "Clear the entire add colors list");
+    btnClearAdd->setParent(*grpAdd);
+    page->addChild(*btnClearAdd);
+
+    OFX::IntParamDescriptor *numAdd = desc.defineIntParam(kParamNumAddColors);
+    numAdd->setDefault(0);
+    numAdd->setIsSecret(true); // Persists count in script
+    numAdd->setParent(*grpAdd);
+    page->addChild(*numAdd);
+
+    for (int i = 0; i < kMaxListColors; ++i) {
+        std::string nameColor = std::string(kParamPrefixAddColor) + std::to_string(i);
+        std::string labelColor = "Color " + std::to_string(i + 1);
+        OFX::RGBParamDescriptor *slot = desc.defineRGBParam(nameColor);
+        slot->setLabels(labelColor, labelColor, labelColor);
+        slot->setDefault(0.0, 0.0, 0.0);
+        slot->setIsSecret(true);
+        slot->setParent(*grpAdd);
+        page->addChild(*slot);
+
+        std::string nameDel = std::string(kParamPrefixDelAdd) + std::to_string(i);
+        std::string labelDel = "[X] Delete " + std::to_string(i + 1);
+        OFX::PushButtonParamDescriptor *delBtn = desc.definePushButtonParam(nameDel);
+        delBtn->setLabels(labelDel, labelDel, labelDel);
+        delBtn->setIsSecret(true);
+        delBtn->setParent(*grpAdd);
+        page->addChild(*delBtn);
+    }
+
+    // -------------------------------------------------------------------------
+    // Sub Colors (Exclude from Matte) Group - Spins up under an arrow
+    // -------------------------------------------------------------------------
+    OFX::GroupParamDescriptor *grpSub = desc.defineGroupParam(kParamGrpSubColors);
+    grpSub->setLabels("Sub Colors (Exclude from Matte)", "Sub Colors", "Subtracted qualified colors list");
+    grpSub->setHint("List of colors to subtract/carve out from the qualified matte");
+    grpSub->setOpen(false); // Spins up (collapsed) under an arrow by default
+    page->addChild(*grpSub);
+
+    OFX::RGBParamDescriptor *pickSub = desc.defineRGBParam(kParamPickSubColor);
+    pickSub->setLabels("Sample Sub Color", "Sample Sub", "Eye-dropper for subtracting colors");
+    pickSub->setHint("Sample with the eye-dropper to subtract colors continuously or via button");
+    pickSub->setDefault(0.0, 0.0, 0.0);
+    pickSub->setParent(*grpSub);
+    page->addChild(*pickSub);
+
+    OFX::BooleanParamDescriptor *contSub = desc.defineBooleanParam(kParamContinuousSub);
+    contSub->setLabels("Continuous Selection Mode", "Continuous", "Auto-subtract on eye-dropper sampling");
+    contSub->setHint("Automatically add new sampled colors to the sub list when picking footage");
+    contSub->setDefault(true);
+    contSub->setParent(*grpSub);
+    page->addChild(*contSub);
+
+    OFX::PushButtonParamDescriptor *btnSub = desc.definePushButtonParam(kParamBtnSubColor);
+    btnSub->setLabels("+ Add Sampled Sub Color", "+ Add Sub Color", "Append sampled sub color to list");
+    btnSub->setParent(*grpSub);
+    page->addChild(*btnSub);
+
+    OFX::PushButtonParamDescriptor *btnClearSub = desc.definePushButtonParam(kParamBtnClearSub);
+    btnClearSub->setLabels("Clear All Sub Colors", "Clear All", "Clear the entire sub colors list");
+    btnClearSub->setParent(*grpSub);
+    page->addChild(*btnClearSub);
+
+    OFX::IntParamDescriptor *numSub = desc.defineIntParam(kParamNumSubColors);
+    numSub->setDefault(0);
+    numSub->setIsSecret(true);
+    numSub->setParent(*grpSub);
+    page->addChild(*numSub);
+
+    for (int i = 0; i < kMaxListColors; ++i) {
+        std::string nameColor = std::string(kParamPrefixSubColor) + std::to_string(i);
+        std::string labelColor = "Sub " + std::to_string(i + 1);
+        OFX::RGBParamDescriptor *slot = desc.defineRGBParam(nameColor);
+        slot->setLabels(labelColor, labelColor, labelColor);
+        slot->setDefault(0.0, 0.0, 0.0);
+        slot->setIsSecret(true);
+        slot->setParent(*grpSub);
+        page->addChild(*slot);
+
+        std::string nameDel = std::string(kParamPrefixDelSub) + std::to_string(i);
+        std::string labelDel = "[X] Delete " + std::to_string(i + 1);
+        OFX::PushButtonParamDescriptor *delBtn = desc.definePushButtonParam(nameDel);
+        delBtn->setLabels(labelDel, labelDel, labelDel);
+        delBtn->setIsSecret(true);
+        delBtn->setParent(*grpSub);
+        page->addChild(*delBtn);
+    }
+
+    // -------------------------------------------------------------------------
+    // Tolerance Controls (Ch1 Hue/Y, Ch2 Sat/Cb, Ch3 Val/Cr)
+    // -------------------------------------------------------------------------
     OFX::DoubleParamDescriptor *hueSpread = desc.defineDoubleParam(kParamHueSpread);
-    hueSpread->setLabels("Hue Spread", "Hue Spread", "Hue tolerance spread");
+    hueSpread->setLabels("Hue / Y Spread", "Hue Spread", "Channel 1 tolerance plateau");
     hueSpread->setRange(0.0, 0.5);
     hueSpread->setDisplayRange(0.0, 0.5);
     hueSpread->setDefault(0.1);
@@ -710,7 +1208,7 @@ void SecondaryKeyerFactory::describeInContext(OFX::ImageEffectDescriptor &desc, 
     page->addChild(*hueSpread);
 
     OFX::DoubleParamDescriptor *hueFalloff = desc.defineDoubleParam(kParamHueFalloff);
-    hueFalloff->setLabels("Hue Falloff", "Hue Falloff", "Hue softness falloff");
+    hueFalloff->setLabels("Hue / Y Falloff", "Hue Falloff", "Channel 1 softness transition");
     hueFalloff->setRange(0.001, 0.5);
     hueFalloff->setDisplayRange(0.001, 0.5);
     hueFalloff->setDefault(0.05);
@@ -718,9 +1216,8 @@ void SecondaryKeyerFactory::describeInContext(OFX::ImageEffectDescriptor &desc, 
     hueFalloff->setAnimates(true);
     page->addChild(*hueFalloff);
 
-    // Saturation Controls
     OFX::DoubleParamDescriptor *satSpread = desc.defineDoubleParam(kParamSatSpread);
-    satSpread->setLabels("Sat Spread", "Sat Spread", "Saturation tolerance spread");
+    satSpread->setLabels("Sat / Cb Spread", "Sat Spread", "Channel 2 tolerance plateau");
     satSpread->setRange(0.0, 1.0);
     satSpread->setDisplayRange(0.0, 1.0);
     satSpread->setDefault(0.2);
@@ -729,7 +1226,7 @@ void SecondaryKeyerFactory::describeInContext(OFX::ImageEffectDescriptor &desc, 
     page->addChild(*satSpread);
 
     OFX::DoubleParamDescriptor *satFalloff = desc.defineDoubleParam(kParamSatFalloff);
-    satFalloff->setLabels("Sat Falloff", "Sat Falloff", "Saturation softness falloff");
+    satFalloff->setLabels("Sat / Cb Falloff", "Sat Falloff", "Channel 2 softness transition");
     satFalloff->setRange(0.001, 1.0);
     satFalloff->setDisplayRange(0.001, 1.0);
     satFalloff->setDefault(0.1);
@@ -737,9 +1234,8 @@ void SecondaryKeyerFactory::describeInContext(OFX::ImageEffectDescriptor &desc, 
     satFalloff->setAnimates(true);
     page->addChild(*satFalloff);
 
-    // Value Controls
     OFX::DoubleParamDescriptor *valSpread = desc.defineDoubleParam(kParamValSpread);
-    valSpread->setLabels("Val Spread", "Val Spread", "Value/Luma tolerance spread");
+    valSpread->setLabels("Val / Cr Spread", "Val Spread", "Channel 3 tolerance plateau");
     valSpread->setRange(0.0, 1.0);
     valSpread->setDisplayRange(0.0, 1.0);
     valSpread->setDefault(0.2);
@@ -748,7 +1244,7 @@ void SecondaryKeyerFactory::describeInContext(OFX::ImageEffectDescriptor &desc, 
     page->addChild(*valSpread);
 
     OFX::DoubleParamDescriptor *valFalloff = desc.defineDoubleParam(kParamValFalloff);
-    valFalloff->setLabels("Val Falloff", "Val Falloff", "Value/Luma softness falloff");
+    valFalloff->setLabels("Val / Cr Falloff", "Val Falloff", "Channel 3 softness transition");
     valFalloff->setRange(0.001, 1.0);
     valFalloff->setDisplayRange(0.001, 1.0);
     valFalloff->setDefault(0.1);
@@ -756,9 +1252,11 @@ void SecondaryKeyerFactory::describeInContext(OFX::ImageEffectDescriptor &desc, 
     valFalloff->setAnimates(true);
     page->addChild(*valFalloff);
 
-    // Matte Finesse (Spatial Morphological & Convolution Ops)
+    // -------------------------------------------------------------------------
+    // Matte Finesse Controls
+    // -------------------------------------------------------------------------
     OFX::DoubleParamDescriptor *matteShrink = desc.defineDoubleParam(kParamMatteShrink);
-    matteShrink->setLabels("Matte Shrink", "Matte Shrink", "Erode matte (pixels)");
+    matteShrink->setLabels("Matte Shrink", "Matte Shrink", "Circular erosion radius (pixels)");
     matteShrink->setRange(0.0, 50.0);
     matteShrink->setDisplayRange(0.0, 50.0);
     matteShrink->setDefault(0.0);
@@ -767,7 +1265,7 @@ void SecondaryKeyerFactory::describeInContext(OFX::ImageEffectDescriptor &desc, 
     page->addChild(*matteShrink);
 
     OFX::DoubleParamDescriptor *matteGrow = desc.defineDoubleParam(kParamMatteGrow);
-    matteGrow->setLabels("Matte Grow", "Matte Grow", "Dilate matte (pixels)");
+    matteGrow->setLabels("Matte Grow", "Matte Grow", "Circular dilation radius (pixels)");
     matteGrow->setRange(0.0, 50.0);
     matteGrow->setDisplayRange(0.0, 50.0);
     matteGrow->setDefault(0.0);
@@ -776,7 +1274,7 @@ void SecondaryKeyerFactory::describeInContext(OFX::ImageEffectDescriptor &desc, 
     page->addChild(*matteGrow);
 
     OFX::DoubleParamDescriptor *matteBlur = desc.defineDoubleParam(kParamMatteBlur);
-    matteBlur->setLabels("Matte Blur", "Matte Blur", "Gaussian blur radius (pixels)");
+    matteBlur->setLabels("Matte Blur", "Matte Blur", "Blur radius (pixels)");
     matteBlur->setRange(0.0, 100.0);
     matteBlur->setDisplayRange(0.0, 100.0);
     matteBlur->setDefault(0.0);
@@ -784,7 +1282,21 @@ void SecondaryKeyerFactory::describeInContext(OFX::ImageEffectDescriptor &desc, 
     matteBlur->setAnimates(true);
     page->addChild(*matteBlur);
 
+    // Spatial Filter Type (4 best filters)
+    OFX::ChoiceParamDescriptor *filterType = desc.defineChoiceParam(kParamFilterType);
+    filterType->setLabels("Blur Filter Type", "Filter Type", "Spatial convolution kernel");
+    filterType->setHint("Select the spatial blur convolution kernel type");
+    filterType->appendOption("Gaussian (Separable Optical)");
+    filterType->appendOption("Box Blur (Uniform Window)");
+    filterType->appendOption("Triangle (Tent Linear)");
+    filterType->appendOption("Exponential (Decay Tail)");
+    filterType->setDefault(0);
+    filterType->setAnimates(true);
+    page->addChild(*filterType);
+
+    // -------------------------------------------------------------------------
     // Output Mode Choice
+    // -------------------------------------------------------------------------
     OFX::ChoiceParamDescriptor *outputMode = desc.defineChoiceParam(kParamOutputMode);
     outputMode->setLabels("Output Mode", "Output Mode", "Render mode selection");
     outputMode->appendOption("Premultiplied RGBA");
@@ -792,6 +1304,29 @@ void SecondaryKeyerFactory::describeInContext(OFX::ImageEffectDescriptor &desc, 
     outputMode->setDefault(0);
     outputMode->setAnimates(true);
     page->addChild(*outputMode);
+
+    // -------------------------------------------------------------------------
+    // Legacy Single Add/Sub (hidden by default for backward compatibility)
+    // -------------------------------------------------------------------------
+    OFX::BooleanParamDescriptor *enableAdd = desc.defineBooleanParam(kParamEnableAdd);
+    enableAdd->setDefault(false);
+    enableAdd->setIsSecret(true);
+    page->addChild(*enableAdd);
+
+    OFX::RGBParamDescriptor *colorAdd = desc.defineRGBParam(kParamColorAdd);
+    colorAdd->setDefault(0.0, 0.0, 0.0);
+    colorAdd->setIsSecret(true);
+    page->addChild(*colorAdd);
+
+    OFX::BooleanParamDescriptor *enableSub = desc.defineBooleanParam(kParamEnableSub);
+    enableSub->setDefault(false);
+    enableSub->setIsSecret(true);
+    page->addChild(*enableSub);
+
+    OFX::RGBParamDescriptor *colorSub = desc.defineRGBParam(kParamColorSub);
+    colorSub->setDefault(0.0, 0.0, 0.0);
+    colorSub->setIsSecret(true);
+    page->addChild(*colorSub);
 }
 
 OFX::ImageEffect* SecondaryKeyerFactory::createInstance(OfxImageEffectHandle handle, OFX::ContextEnum /*context*/) {

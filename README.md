@@ -4,33 +4,55 @@
 [![Standard: C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://en.wikipedia.org/wiki/C%2B%2B17)
 [![OpenFX](https://img.shields.io/badge/OpenFX-1.5-green.svg)](https://github.com/AcademySoftwareFoundation/openfx)
 
-**LibreSecondary** is a high-performance, open-source OpenFX (OFX) image effect plugin implementing a DaVinci Resolve-style Secondary Keyer (HSV Qualifier) targeting **Foundry Nuke** as the primary host.
+**LibreSecondary** is a high-performance OpenFX (OFX) image effect plugin implementing a DaVinci Resolve-style Secondary Keyer (Qualifier) targeting **Foundry Nuke** as the primary host.
 
 ---
 
-## Features
+## Key Features
 
-- **HSV Secondary Qualification:**
-  - **Base Pick Color (`hsv_pick`):** Target base color qualification.
-  - **Additional Qualified Color (`enable_add`, `color_add`):** Add a secondary color range (`max(base, add)`).
-  - **Subtracted Qualified Color (`enable_sub`, `color_sub`):** Exclude an unwanted color range (`max(0, combined - sub)`).
-- **Hermite Smoothstep Isolation Curves:**
-  - Independent **Spread** (flat pass region) and **Falloff** (Hermite $3t^2 - 2t^3$ transition) parameters for **Hue**, **Saturation**, and **Value**.
-  - Circular periodic hue distance calculation accounting for $[0.0, 1.0)$ wrap-around.
-- **Matte Finesse (Spatial Morphological & Convolution Ops):**
-  - **Matte Shrink (`matte_shrink`):** Circular erosion (minimum filter).
-  - **Matte Grow (`matte_grow`):** Circular dilation (maximum filter).
-  - **Matte Blur (`matte_blur`):** 2-pass separable Gaussian blur convolution.
+- **Multi-Color Space Qualification:**
+  - **HSV (Hue, Saturation, Value):** Classic perceptual color grading model with periodic hue distance wrap $[0.0, 1.0)$.
+  - **HSL (Hue, Saturation, Lightness):** Symmetrical lightness qualification with perceptual color saturation.
+  - **YCbCr (ITU-R BT.709):** Digital broadcast broadcast-standard luma ($Y$) and blue/red-difference chrominance ($Cb, Cr$).
+
+- **Continuous Add & Sub Multi-Color Lists (like Keylight):**
+  - **Continuous Selection Mode:** Sample footage continuously with the eye-dropper to dynamically add or subtract color swatches into the active qualification lists.
+  - **Collapsible Disclosure Groups:** Add Colors and Sub Colors lists are nested inside dedicated groups that spin up / collapse under an arrow.
+  - **Individual Delete Buttons:** Each added or subtracted color swatch in the list has an individual `[X]` delete button for instant removal.
+  - **Clear All:** Single-click clearing of additive or subtractive qualification sets.
+  - **Project State Persistence:** Active color lists automatically persist across Nuke project save and reload.
+
+- **4 Best Falloff Curves:**
+  - **Smoothstep (Hermite Cubic):** $1 - (3t^2 - 2t^3)$ — Industry standard gradual roll-off with flat boundary tangents.
+  - **Smootherstep (Perlin Quintic):** $1 - (6t^5 - 15t^4 + 10t^3)$ — Continuous 1st and 2nd derivatives for ultra-smooth edge transitions without perceptual knees.
+  - **Cosine (Filmic S-Curve):** $0.5 \cdot (1 + \cos(\pi t))$ — Photographic, organic S-curve matching human visual roll-off.
+  - **Linear (Crisp Slope):** $1 - t$ — Direct linear slope for sharp, mathematically uniform transitions.
+
+- **4 Best Spatial Blur Filter Types:**
+  - **Gaussian (Separable Optical):** True 2-pass separable Gaussian convolution ($e^{-k^2/(2\sigma^2)}$) for natural photographic edge softening.
+  - **Box Blur (Uniform Window):** Fast moving average box filter for flat, even edge feathering.
+  - **Triangle (Tent Linear):** Linearly-weighted 2-pass filter with sharper feature peak retention than Gaussian.
+  - **Exponential (Decay Tail):** Sharp central peak with long optical decay tail ($e^{-|k|/\sigma}$) mimicking optical flare and glow roll-off.
+
+- **Matte Finesse & Morphology:**
+  - **Matte Shrink:** Circular erosion (minimum filter).
+  - **Matte Grow:** Circular dilation (maximum filter).
+  - **Matte Blur:** 2-pass separable convolution using the selected filter type.
+
 - **Tile-Based Rendering Architecture:**
   - Overrides `getRegionsOfInterest` and `getRegionOfDefinition` to request necessary spatial padding from the host, eliminating tile boundary and seam artifacts during tiled or multi-threaded rendering in Nuke.
-- **Multi-Threaded Image Processing:**
-  - Multi-pass processing orchestrated using OpenFX's native `OFX::MultiThread::Processor` to leverage all CPU cores.
-  - Fast-path execution: Zero buffer allocation and single-pass composite when spatial finesse is set to zero.
+
+- **Multi-Threaded Processing:**
+  - Native SMP multi-threading via `OFX::MultiThread::Processor::multiThread()`.
+  - Zero-allocation fast path when spatial finesse is set to zero.
+
 - **Output Modes:**
   - **Premultiplied RGBA:** R, G, B multiplied by qualified alpha matte, with matte in Alpha.
   - **Alpha Matte Only:** Qualified matte written across all RGBA channels for inspection or direct masking.
+
 - **Pixel Depth Support:**
   - 32-bit floating-point RGBA (`OFX::eBitDepthFloat`, `OFX::ePixelComponentRGBA`).
+
 - **Permissive MIT License:**
   - Free from GPL dependencies; suitable for commercial visual effects production pipelines.
 
@@ -76,7 +98,7 @@ LibreSecondary/
    sudo dnf install -y cmake git
    ```
 
-2. Clone the repository and configure with CMake:
+2. Clone repository and configure with CMake:
    ```bash
    git clone https://github.com/erinwnash/LibreSecondary.git
    cd LibreSecondary
@@ -153,25 +175,38 @@ Inside Nuke:
 
 ---
 
-## Parameters
+## Parameters Reference
 
-| Parameter | Type | Default | Range | Description |
+| Parameter | Type | Default | Options / Range | Description |
 |:---|:---|:---:|:---:|:---|
-| **`hsv_pick`** | RGB | (0, 0, 0) | [0, 1] | Target base color to isolate using HSV qualification |
-| **`enable_add`** | Bool | `false` | `true`/`false` | Enable additional color range in matte |
-| **`color_add`** | RGB | (0, 0, 0) | [0, 1] | Additional color to union with base matte |
-| **`enable_sub`** | Bool | `false` | `true`/`false` | Enable subtraction of color range from matte |
-| **`color_sub`** | RGB | (0, 0, 0) | [0, 1] | Color range to subtract from qualified matte |
-| **`hue_spread`** | Double | 0.1 | [0.0, 0.5] | Half-width of flat tolerance plateau in Hue |
-| **`hue_falloff`** | Double | 0.05 | [0.001, 0.5] | Softness transition width beyond hue spread |
-| **`sat_spread`** | Double | 0.2 | [0.0, 1.0] | Half-width of flat tolerance plateau in Saturation |
-| **`sat_falloff`** | Double | 0.1 | [0.001, 1.0] | Softness transition width beyond sat spread |
-| **`val_spread`** | Double | 0.2 | [0.0, 1.0] | Half-width of flat tolerance plateau in Value/Luma |
-| **`val_falloff`** | Double | 0.1 | [0.001, 1.0] | Softness transition width beyond val spread |
+| **`color_space`** | Choice | `HSV` | `HSV`, `HSL`, `YCbCr (Rec. 709)` | Operating qualification color space |
+| **`falloff_curve`** | Choice | `Smoothstep` | `Smoothstep`, `Smootherstep`, `Cosine`, `Linear` | Mathematical transition roll-off profile |
+| **`hsv_pick`** | RGB | (0, 0, 0) | [0, 1] | Target primary base color to isolate |
+| **`grp_add_colors`** | Group | *Collapsed* | — | Group for expanding qualification (spins up under arrow) |
+| **`pick_add_color`** | RGB | (0, 0, 0) | [0, 1] | Eye-dropper for sampling additional colors |
+| **`continuous_add`** | Bool | `true` | `true`/`false` | Automatically add sampled colors on eye-dropper click |
+| **`btn_add_color`** | Button | — | — | Explicit button to append sampled color to list |
+| **`btn_clear_add`** | Button | — | — | Clear all added colors from the list |
+| **`add_color_0..15`**| RGB | (0, 0, 0) | [0, 1] | Individual color swatches in the Add list |
+| **`del_add_0..15`** | Button | `[X]` | — | Individual delete button for each added color |
+| **`grp_sub_colors`** | Group | *Collapsed* | — | Group for carving out colors (spins up under arrow) |
+| **`pick_sub_color`** | RGB | (0, 0, 0) | [0, 1] | Eye-dropper for sampling subtracted colors |
+| **`continuous_sub`** | Bool | `true` | `true`/`false` | Automatically subtract sampled colors on eye-dropper click |
+| **`btn_sub_color`** | Button | — | — | Explicit button to append sampled sub color to list |
+| **`btn_clear_sub`** | Button | — | — | Clear all subtracted colors from the list |
+| **`sub_color_0..15`**| RGB | (0, 0, 0) | [0, 1] | Individual color swatches in the Sub list |
+| **`del_sub_0..15`** | Button | `[X]` | — | Individual delete button for each subtracted color |
+| **`hue_spread`** | Double | 0.1 | [0.0, 0.5] | Channel 1 (Hue / Y) tolerance plateau half-width |
+| **`hue_falloff`** | Double | 0.05 | [0.001, 0.5] | Channel 1 (Hue / Y) softness transition width |
+| **`sat_spread`** | Double | 0.2 | [0.0, 1.0] | Channel 2 (Sat / Cb) tolerance plateau half-width |
+| **`sat_falloff`** | Double | 0.1 | [0.001, 1.0] | Channel 2 (Sat / Cb) softness transition width |
+| **`val_spread`** | Double | 0.2 | [0.0, 1.0] | Channel 3 (Val / Cr) tolerance plateau half-width |
+| **`val_falloff`** | Double | 0.1 | [0.001, 1.0] | Channel 3 (Val / Cr) softness transition width |
 | **`matte_shrink`**| Double | 0.0 | [0.0, 50.0] | Morphological circular erosion radius in pixels |
 | **`matte_grow`**  | Double | 0.0 | [0.0, 50.0] | Morphological circular dilation radius in pixels |
-| **`matte_blur`**  | Double | 0.0 | [0.0, 100.0] | Separable Gaussian blur standard deviation ($\sigma$) |
-| **`output_mode`** | Choice | `Premultiplied RGBA` | 0 or 1 | Switch between `Premultiplied RGBA` and `Alpha Matte Only` |
+| **`matte_blur`**  | Double | 0.0 | [0.0, 100.0] | Spatial blur radius ($\sigma$) in pixels |
+| **`filter_type`** | Choice | `Gaussian` | `Gaussian`, `Box`, `Triangle`, `Exponential` | Spatial convolution blur kernel type |
+| **`output_mode`** | Choice | `Premultiplied` | `Premultiplied RGBA`, `Alpha Matte Only` | Render output mode |
 
 ---
 
